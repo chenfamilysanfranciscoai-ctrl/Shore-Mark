@@ -1,0 +1,96 @@
+name: Update volunteer events
+
+on:
+  schedule:
+    # Once a month: the 1st of every month at 15:00 UTC (8:00 AM Pacific Daylight
+    # Time; GitHub cron always runs in UTC). The script looks 8 weeks ahead, so a
+    # monthly run always leaves several weeks of upcoming events on the site.
+    # You can still run it any time by hand from the Actions tab.
+    - cron: "0 15 1 * *"
+  workflow_dispatch:       # lets you trigger a run manually from the Actions tab
+    inputs:
+      only_orgs:
+        description: "Optional: test only these organizations (name fragments, comma separated, e.g. food bank). Everyone else keeps their current events."
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run: read everything and print the results, but do not change events.json"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# Only one run of this workflow at a time -- e.g. a manual "Run workflow" click
+# that overlaps with the scheduled run is the most likely way the remote branch
+# moves out from under this job between checkout and push. Queue instead of
+# running concurrently rather than racing to push.
+concurrency:
+  group: update-events
+  cancel-in-progress: false
+
+jobs:
+  update-events:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright's Chromium
+        # Only needed as a fallback for sites whose calendar/event links are
+        # injected by client-side JS -- see render_with_playwright() in the
+        # script. --with-deps pulls in the OS libraries Chromium needs on the
+        # bare Ubuntu runner.
+        run: playwright install --with-deps chromium
+
+      - name: Run event updater
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Optional -- see README. When this secret is set, Surfrider's and
+          # Pacific Beach Coalition's calendars are read straight from
+          # Google's own Calendar API instead of the older AI-extraction
+          # pipeline. Safe to leave unset: those two orgs just fall back to
+          # the older pipeline until it's added.
+          GOOGLE_CALENDAR_API_KEY: ${{ secrets.GOOGLE_CALENDAR_API_KEY }}
+          # Only set when you start the run by hand from the Actions tab.
+          ONLY_ORGS: ${{ github.event.inputs.only_orgs }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: python scripts/update_events.py
+
+      - name: Commit and push events.json if it changed
+        run: |
+          if git diff --quiet -- events.json; then
+            echo "No changes to events.json"
+            exit 0
+          fi
+          git config user.name "volunteer-map-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add events.json
+          git commit -m "Auto-update volunteer events [skip ci]"
+
+          # The checkout at the top of this job is a snapshot from when the run
+          # started -- if anything else landed on main since then (another run,
+          # a manual commit), a plain `git push` is rejected with "fetch first".
+          # Rebase our one commit onto whatever is actually on main right now,
+          # then push, retrying a few times in case of a tight race.
+          for attempt in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "Pushed on attempt $attempt"
+              exit 0
+            fi
+            # Leave a clean slate for the next attempt even if the rebase
+            # itself is what failed (e.g. a real conflict, not just a race).
+            git rebase --abort 2>/dev/null || true
+            echo "Push attempt $attempt failed, retrying after a short wait..."
+            sleep $((attempt * 5))
+          done
+          echo "Failed to push events.json after 5 attempts -- if this keeps happening, it's a real conflict (e.g. events.json was hand-edited) rather than a race, and needs a human to sort out" >&2
+          exit 1
